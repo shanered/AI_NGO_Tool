@@ -1,0 +1,5 @@
+# macOS
+.DS_Store
+
+# Keep local Streamlit secrets out of GitHub
+.streamlit/secrets.toml
