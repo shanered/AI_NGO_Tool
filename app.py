@@ -1,468 +1,612 @@
-# app.py — NGO AI Tool (Streamlit, resilient DOCX fallback)
-# If python-docx is missing, app still runs and offers .txt downloads + banner to install it.
-# Install to enable Word downloads:
-#   pip install python-docx PyPDF2
-
 import io
 import re
-import time
+import string
+from collections import Counter
 from datetime import datetime
-from typing import Dict, List, Tuple
 
+import pandas as pd
 import streamlit as st
 
-# ------- Optional packages -------
+# -------- Optional deps we try to import gracefully --------
+# PDF / DOCX extraction
 try:
-    from docx import Document
-    from docx.shared import Pt
-    from docx.enum.text import WD_ALIGN_PARAGRAPH
-    HAS_DOCX = True
+    from pypdf import PdfReader  # modern PyPDF2 fork
 except Exception:
-    HAS_DOCX = False
+    PdfReader = None
 
 try:
-    import PyPDF2  # type: ignore
-    HAS_PYPDF2 = True
+    from docx import Document  # python-docx
 except Exception:
-    HAS_PYPDF2 = False
+    Document = None
 
-# ------------------------- App Config -------------------------
-st.set_page_config(page_title="NGO AI Tool (Mock)", page_icon="🌍", layout="wide")
 
-WORDS_PRESETS = {"Short": 300, "Standard": 600, "Long": 1000}
-PASTE_WORD_LIMIT = 5000
+# =========================
+# Utilities & Persistence
+# =========================
+def ss_init():
+    """Initialize all session_state keys once."""
+    if "nav" not in st.session_state:
+        st.session_state.nav = "Home"
 
-DEFAULT_SECTIONS = [
-    ("executive_summary",       "Executive Summary",                         True, 600),
-    ("problem_statement",       "Problem Statement / Needs",                 True, 600),
-    ("context_trends",          "Context & Trends (incl. aid cuts)",         True, 600),
-    ("objectives_results",      "Objectives & Results (logframe-lite)",      True, 600),
-    ("methodology",             "Methodology / Workplan",                    True, 600),
-    ("safeguarding_inclusion",  "Safeguarding, Gender & Inclusion",          True, 400),
-    ("m_e_learning",            "M&E & Learning",                            True, 400),
-    ("risk_mgmt",               "Risks & Mitigation",                        False, 300),
-    ("budget_summary",          "Budget Summary & VfM",                      False, 300),
-    ("org_capacity",            "Org Capacity & Past Performance",           True, 300),
-]
+    # Scanner
+    st.session_state.setdefault("scanner_paste", "")
+    st.session_state.setdefault("scanner_summary_md", "")
+    st.session_state.setdefault("scanner_text_raw", "")
 
-NAV = ["Home", "Grant / Tender Scanner", "Aid Trends", "Concept Note Builder", "Exports", "Settings"]
+    # Trends
+    st.session_state.setdefault("trends_region", "Global")
+    st.session_state.setdefault("trends_theme", "Climate")
+    st.session_state.setdefault("trends_horizon", "Long (3–5y)")
+    st.session_state.setdefault("trends_audience", "Programme Team")
+    st.session_state.setdefault("trends_notes", "")
+    st.session_state.setdefault("trends_brief_md", "")
 
-# ------------------------- Session State -------------------------
-if "sections" not in st.session_state:
-    st.session_state.sections = {k: {"label": lbl, "on": on, "words": words}
-                                 for k, lbl, on, words in DEFAULT_SECTIONS}
+    # Funding feed (mock)
+    st.session_state.setdefault("feed_region", "All")
+    st.session_state.setdefault("feed_sector", [])
+    st.session_state.setdefault("feed_country", "")
+    st.session_state.setdefault("feed_grant_min", 50_000)
+    st.session_state.setdefault("feed_grant_max", 500_000)
+    st.session_state.setdefault("feed_size", "All")
+    st.session_state.setdefault("feed_df", pd.DataFrame())
+    st.session_state.setdefault("feed_shortlist_df", pd.DataFrame())
 
-for key in ["scanner_bytes", "scanner_name", "trends_bytes", "trends_name", "concept_bytes", "concept_name"]:
-    if key not in st.session_state:
-        st.session_state[key] = None
+    # Concept note
+    st.session_state.setdefault("cn_sections", {})  # generated text per section
+    st.session_state.setdefault("cn_full_md", "")
 
-if "banner_dismissed" not in st.session_state:
-    st.session_state.banner_dismissed = False
+    # Exports store: dict[name] = {"bytes":..., "filename":...}
+    st.session_state.setdefault("exports", {})
 
-# ------------------------- Helpers & CSS -------------------------
+
 def clean_text(s: str) -> str:
-    return re.sub(r"\s+", " ", (s or "")).strip()
+    """Squash whitespace; remove repeated spaces; trim weird breaks."""
+    s = s.replace("\r", "\n")
+    s = re.sub(r"[ \t]+", " ", s)
+    s = re.sub(r"\n{3,}", "\n\n", s)
+    return s.strip()
 
-def word_count(s: str) -> int:
-    return len([w for w in re.split(r"\s+", s.strip()) if w])
 
-def enforce_soft_limit(text: str, limit_words: int) -> str:
-    words = text.split()
-    if len(words) <= limit_words:
-        return text
-    return " ".join(words[:limit_words])
+def extract_text_from_upload(file) -> str:
+    """Try to read TXT / DOCX / PDF. Return plain text (or '')."""
+    name = (file.name or "").lower()
 
-def pill_css():
-    st.markdown("""
-    <style>
-      .pill {display:inline-block;padding:.25rem .6rem;border-radius:999px;font-size:.75rem;margin:.125rem;}
-      .pill.gray{background:#f3f4f6;color:#111827}
-      .pill.green{background:#dcfce7;color:#065f46}
-      .pill.red{background:#fee2e2;color:#991b1b}
-      .pill.blue{background:#e0f2fe;color:#075985}
-      .card{background:#1118270d;border:1px solid #2a2f3a;border-radius:16px;padding:16px}
-      .muted{color:#9ca3af}
-      .lead{font-size:1.05rem}
-      .banner{background:#fff3cd;color:#7a5d00;border:1px solid #ffe69c;border-radius:12px;padding:12px 14px;margin-bottom:16px;}
-    </style>
-    """, unsafe_allow_html=True)
-
-def pill(text: str, tone: str="gray"):
-    st.markdown(f"<span class='pill {tone}'>{text}</span>", unsafe_allow_html=True)
-
-def prototype_banner():
-    if st.session_state.banner_dismissed:
-        return
-    text = "This is a local prototype. Data isn’t saved and features are limited."
-    if not HAS_DOCX:
-        text += " Word downloads are disabled because `python-docx` isn’t installed. Run: `pip install python-docx`."
-    st.markdown(f"<div class='banner'><b>Prototype:</b> {text}</div>", unsafe_allow_html=True)
-    st.button("Dismiss", key="dismiss_banner", on_click=lambda: st.session_state.update(banner_dismissed=True))
-
-def extract_text_from_upload(upload) -> str:
-    name = upload.name.lower()
-    data = upload.read()
-
+    # TXT
     if name.endswith(".txt"):
         try:
-            return data.decode("utf-8", errors="ignore")
+            return file.read().decode("utf-8", errors="ignore")
         except Exception:
-            return data.decode("latin-1", errors="ignore")
+            return file.read().decode("latin-1", errors="ignore")
 
-    if name.endswith(".docx"):
+    # DOCX
+    if name.endswith(".docx") and Document is not None:
         try:
-            from docx import Document as DocxDocument  # local import to avoid hard dependency
-            f = io.BytesIO(data)
-            doc = DocxDocument(f)
+            doc = Document(file)
             return "\n".join(p.text for p in doc.paragraphs)
         except Exception:
             return ""
 
-    if name.endswith(".pdf"):
-        if not HAS_PYPDF2:
-            return ""
+    # PDF
+    if name.endswith(".pdf") and PdfReader is not None:
+        text_parts = []
         try:
-            text = []
-            reader = PyPDF2.PdfReader(io.BytesIO(data))
+            reader = PdfReader(file)
             for page in reader.pages:
-                text.append(page.extract_text() or "")
-            return "\n".join(text)
+                t = page.extract_text() or ""
+                text_parts.append(t)
+            return "\n".join(text_parts)
         except Exception:
             return ""
 
     return ""
 
-def mock_extract_meta(consolidated_text: str) -> Dict[str, List[str]]:
-    t = clean_text(consolidated_text).lower()
-    sectors = [k for k in [
-        "livelihoods","agriculture","cash","voucher","climate","tvet","education",
-        "wash","protection","nutrition","governance","market systems","sme","health"
-    ] if k in t]
-    geos = [g.title() for g in ["kenya","somalia","tanzania","uganda","rwanda","ethiopia","ukraine","indonesia"] if g in t]
-    donors = [d.upper() for d in ["usaid","fcdo","sida","eu","eib","world bank","jica","giz","adb"] if d.lower() in t]
-    red = []
-    if "48 hours" in t or "24 hours" in t: red.append("Tight timeline")
-    if "mandatory" in t and "all experts" in t: red.append("All roles mandatory")
-    if "security clearance" in t: red.append("Security clearance")
-    if not red: red = ["None flagged"]
-    if not sectors: sectors = ["general development"]
-    if not geos: geos = ["Global / LMICs"]
-    if not donors: donors = ["Institutional / Foundations"]
-    return {"sectors": sectors, "geos": geos, "donors": donors, "red": red}
 
-def words_to_bullets(word_target: int) -> int:
-    if word_target <= 350: return 4
-    if word_target <= 700: return 7
-    return 10
+def naive_keywords(text: str, topn=12):
+    """Quick keyword calc: drop urls, numbers, stopwords, punctuation."""
+    text = text.lower()
+    text = re.sub(r"http\S+|www\.\S+", " ", text)
+    text = re.sub(r"\d+", " ", text)
+    text = text.translate(str.maketrans("", "", string.punctuation))
+    tokens = [t for t in text.split() if len(t) > 2]
+    stop = set(
+        """
+        the a an and for from with into upon over under between among out off on in to of by
+        we you they them our your their within across there here this that those these
+        is are was were be been being it its as at or if but so not than then such
+        project programmes program programme tender grant call terms reference
+        will shall may also make take get set due new year years
+        """.split()
+    )
+    tokens = [t for t in tokens if t not in stop]
+    cnt = Counter(tokens)
+    return [w for w, _ in cnt.most_common(topn)]
 
-def section_template(title: str, word_target: int, context: str, trends_hint: str) -> str:
-    bullets = words_to_bullets(word_target)
-    ctx_line = clean_text(context) if context else "Context provided by the organisation."
-    hint = f" Trend signal: {clean_text(trends_hint)}." if trends_hint else ""
 
-    blocks = []
-    blocks.append(f"{title}\n")
-    blocks.append(f"{ctx_line}{hint}\n")
-    blocks.append("Purpose\n- Clarify the problem and desired change in plain language.\n- Align with community priorities and national frameworks.\n")
-    blocks.append("Expected Results\n" + "\n".join([f"- Result {i}: measurable, time-bound." for i in range(1, min(3, bullets)+1)]) + "\n")
-    act_count = max(3, bullets - 3)
-    blocks.append("Core Activities\n" + "\n".join([f"- Activity {i}: description; local partner role; timeframe." for i in range(1, act_count+1)]) + "\n")
-    blocks.append("Monitoring, Evaluation & Learning (MEL)\n- Indicators: output & outcome, simple tools.\n- Learning loops: quarterly reviews.\n- Data protection & safeguarding integrated.\n")
-    blocks.append("Risks & Value for Money (VfM)\n- Risks: capacity, access, compliance, shocks.\n- Mitigation: clear roles, contingencies, adaptive plans.\n- VfM: economy, efficiency, effectiveness, equity.\n")
-    return "\n".join(blocks).strip()
+def detect_bullets(text: str, max_lines=10):
+    """Pull first few bullet-like lines as a quick sample list."""
+    lines = [l.strip() for l in text.splitlines()]
+    bullets = []
+    for l in lines:
+        if re.match(r"^[-•*]\s+", l) and len(l) > 5:
+            bullets.append(re.sub(r"^[-•*]\s+", "", l))
+        if len(bullets) >= max_lines:
+            break
+    return bullets
 
-def build_concept_note(sections: List[Dict], context: str, trends_hint: str) -> str:
-    parts = [f"CONCEPT NOTE (DRAFT)\n\nGenerated: {datetime.utcnow().isoformat()}Z\n"]
-    for s in sections:
-        parts.append(section_template(s["label"], s["words"], context, trends_hint))
-        parts.append("")
-    return "\n\n".join(parts)
 
-def build_trends_brief(keywords: str, geography: str) -> str:
-    kws = [k.strip() for k in (keywords or "").split(",") if k.strip()]
-    kw_line = ", ".join(kws) if kws else "education, livelihoods, climate resilience"
-    geo_line = geography or "target region"
-    parts = []
-    parts.append("AID TRENDS BRIEF — FOR NGO PLANNING\n")
-    parts.append(f"Keywords: {kw_line}\nGeography: {geo_line}\nDate: {datetime.utcnow().date()}\n")
-    parts.append("Executive Summary\nDonor budgets are under pressure and increasingly performance-oriented. Funding is tilting toward climate resilience, localisation, and results-based delivery. For NGOs, this means sharper value-for-money narratives, stronger local partnerships, and credible MEL.")
-    parts.append("Key Trends\n• Real-terms aid contractions; competition for fewer, larger awards.\n• Climate & resilience mainstreamed; cross-cutting outcomes expected.\n• Localisation: higher sub-grant shares, due-diligence support, joint MEL.\n• Digital/AI for inclusion, measurement, cost control.\n• Blended finance piloted in livelihoods/MSD, with equity safeguards.")
-    parts.append("Implications for NGOs\n• Position proposals with measurable outcomes and realistic unit costs.\n• Structure consortia around local leadership and delivery proximity.\n• Build climate co-benefits across social sectors.\n• Invest in MEL that provides decision-ready feedback.")
-    parts.append("Funding Outlook\n• Fewer, larger frameworks; partner-led entry.\n• Philanthropy/private donors seek catalytic pilots with scale pathways.\n• Emphasis on VfM and adaptive management.")
-    parts.append(f"Recommendations for NGOs in {geo_line}\n• Map local partners in {kw_line}; co-design MoUs/capacity plans.\n• Prepare 2–3 page ‘concept packs’ with objectives, results, and costs.\n• Lightweight pipeline tracker linked to donor signals.\n• Include climate/gender/inclusion indicators.\n• Agree early data-sharing and learning rhythms.")
-    return "\n\n".join(parts)
+def md_code_block(md: str) -> str:
+    """Wrap markdown in a code block for mono display w/o syntax coloring gimmicks."""
+    return f"```\n{md.strip()}\n```"
 
-# -------- DOC GENERATORS --------
-def make_docx(title: str, body_text: str) -> bytes:
-    """Return bytes for a DOCX if available, else TXT."""
-    if HAS_DOCX:
-        doc = Document()
-        p = doc.add_paragraph()
-        run = p.add_run(title)
-        run.bold = True
-        run.font.size = Pt(18)
-        p.alignment = WD_ALIGN_PARAGRAPH.LEFT
-        doc.add_paragraph("")
-        for block in body_text.split("\n\n"):
-            if block.strip():
-                doc.add_paragraph(block)
-        buf = io.BytesIO()
-        doc.save(buf)
-        buf.seek(0)
-        return buf.read()
-    else:
-        # Fallback to TXT bytes
-        return body_text.encode("utf-8")
 
-def extract_labels() -> List[str]:
-    return [meta["label"] for _, meta in st.session_state.sections.items()]
+def make_docx_bytes(markdown_text: str, title="Document"):
+    """Very light DOCX writer (no external APIs)."""
+    if Document is None:
+        # Fallback to TXT if python-docx isn't installed
+        return io.BytesIO(markdown_text.encode("utf-8")), f"{title}.txt"
 
-# ------------------------- Pages -------------------------
+    doc = Document()
+    for para in markdown_text.split("\n"):
+        doc.add_paragraph(para)
+    bio = io.BytesIO()
+    doc.save(bio)
+    bio.seek(0)
+    return bio, f"{title}.docx"
+
+
+def store_export(name: str, markdown_text: str):
+    bio, fname = make_docx_bytes(markdown_text, title=name.replace(" ", "_"))
+    st.session_state.exports[name] = {"bytes": bio.getvalue(), "filename": fname}
+
+
+# =========================
+# UI Bits
+# =========================
+def sidebar_nav():
+    st.sidebar.title("NGO AI Tool (Mock)")
+    st.sidebar.caption("Local prototype, no external APIs.")
+    nav = st.sidebar.radio(
+        "Navigate",
+        ["Home", "Funding Feed", "Grant / Tender Scanner", "Aid Trends", "Concept Note Builder", "Exports", "Settings"],
+        index=["Home", "Funding Feed", "Grant / Tender Scanner", "Aid Trends", "Concept Note Builder", "Exports", "Settings"].index(
+            st.session_state.nav
+        ),
+    )
+    st.session_state.nav = nav
+
+
+# =========================
+# PAGES
+# =========================
 def page_home():
-    prototype_banner()
-    st.title("Welcome 👋")
-    st.write("""
-    **Our pitch:** Our AI tool helps NGOs and development teams analyse **grants, tenders, and donor trends in seconds**.  
-    It tracks **aid cuts, shifting priorities, and funding patterns** so you can target the right opportunities.  
-    Think of it as a **full-time BD analyst**—faster, smarter, and built for today’s evolving aid landscape.
-    """)
-    st.info("Use the left sidebar to try the Grant/Tender Scanner, explore Aid Trends, or build a Concept Note.")
+    st.title("NGO AI Grant Assistant (Local Prototype)")
+    st.caption("Local prototype, no external APIs.")
+
+    st.subheader("What this tool does")
+    st.markdown(
+        """
+- **Find & focus** on relevant grants/tenders (mock feed for now).
+- **Digest ToRs quickly** — paste or upload PDF/DOCX/TXT and get an **inline, clean summary**.
+- **Understand donor trends** — a concise 2-page style brief with indicative sources.
+- **Draft a concept note** — section-by-section, with **optional key data/keywords** and your own word-length sliders.
+- **Export everything** as DOCX from the **Exports** tab.
+        """
+    )
+
+    st.info(
+        "Data persists across tabs in this session. Use **Settings → Reset all** if you want to start over.",
+        icon="💾",
+    )
+
+
+def page_funding_feed():
+    st.title("Funding Feed (mock)")
+    st.caption("Local prototype, no external APIs.")
+
+    with st.expander("Filters", expanded=True):
+        col1, col2 = st.columns(2)
+        with col1:
+            st.session_state.feed_region = st.selectbox(
+                "Region", ["All", "Africa", "Asia", "MENA", "Europe", "LAC"], index=["All", "Africa", "Asia", "MENA", "Europe", "LAC"].index(st.session_state.feed_region)
+            )
+            st.session_state.feed_country = st.text_input(
+                "Country (type to filter)", st.session_state.feed_country
+            )
+        with col2:
+            st.session_state.feed_sector = st.multiselect(
+                "Sector", ["Climate", "Smart Agriculture", "Health", "Education", "Protection", "WASH"], default=st.session_state.feed_sector
+            )
+        col3, col4 = st.columns([2, 1])
+        with col3:
+            st.session_state.feed_grant_min, st.session_state.feed_grant_max = st.slider(
+                "Grant size (USD)", 10_000, 2_000_000, (st.session_state.feed_grant_min, st.session_state.feed_grant_max), step=10_000
+            )
+        with col4:
+            st.session_state.feed_size = st.selectbox(
+                "Size of NGO", ["All", "Small", "Medium", "Large"], index=["All", "Small", "Medium", "Large"].index(st.session_state.feed_size)
+            )
+
+        if st.button("Generate shortlist"):
+            # Build a tiny mock dataset and then filter
+            df = pd.DataFrame(
+                [
+                    {"Opportunity": "Climate Resilience Challenge Fund", "Funder": "Acme Foundation", "Region": "Africa", "Country": "Kenya", "Sector": "Climate", "GrantUSD": 200_000, "Deadline": "2025-10-15"},
+                    {"Opportunity": "Urban Food Systems Innovation", "Funder": "Green Cities Alliance", "Region": "Asia", "Country": "Indonesia", "Sector": "Smart Agriculture", "GrantUSD": 350_000, "Deadline": "2025-11-01"},
+                    {"Opportunity": "Education Equity Small Grants", "Funder": "Open Learning Trust", "Region": "MENA", "Country": "Jordan", "Sector": "Education", "GrantUSD": 80_000, "Deadline": "2025-09-30"},
+                ]
+            )
+            st.session_state.feed_df = df.copy()
+
+            dd = df
+            if st.session_state.feed_region != "All":
+                dd = dd[dd["Region"] == st.session_state.feed_region]
+            if st.session_state.feed_country.strip():
+                dd = dd[dd["Country"].str.contains(st.session_state.feed_country.strip(), case=False, na=False)]
+            if st.session_state.feed_sector:
+                dd = dd[dd["Sector"].isin(st.session_state.feed_sector)]
+            dd = dd[(dd["GrantUSD"] >= st.session_state.feed_grant_min) & (dd["GrantUSD"] <= st.session_state.feed_grant_max)]
+            st.session_state.feed_shortlist_df = dd.reset_index(drop=True)
+
+    if not st.session_state.feed_shortlist_df.empty:
+        st.subheader("Shortlist")
+        st.dataframe(st.session_state.feed_shortlist_df, use_container_width=True)
+        # Save export
+        csv_io = io.StringIO()
+        st.session_state.feed_shortlist_df.to_csv(csv_io, index=False)
+        shortlist_md = f"""# Funding Shortlist
+Generated: {datetime.utcnow().isoformat()}Z
+
+{st.session_state.feed_shortlist_df.to_markdown(index=False)}
+"""
+        store_export("Funding Shortlist", shortlist_md)
+        st.success("Shortlist generated. A DOCX is ready in **Exports**.")
+    else:
+        st.info("No shortlist yet — set filters and click **Generate shortlist**.")
+
 
 def page_scanner():
-    prototype_banner()
-    st.title("Grant / Tender Scanner (mock)")
-    col1, col2 = st.columns([1,1])
+    st.title("Grant / Tender Scanner")
+    st.caption("Paste or upload. Results display below; you can download DOCX and continue to the Concept Note.")
 
-    with col1:
-        st.write("**Paste ToR or core call text** (optional if you upload files).")
-        pasted = st.text_area("Paste text (up to 5,000 words)", height=220, placeholder="Eligibility, scope, geography…")
-        wc = word_count(pasted)
-        st.caption(f"Words: {wc}/{PASTE_WORD_LIMIT}")
-        if wc > PASTE_WORD_LIMIT:
-            st.warning("Text exceeds 5,000 words. It will be truncated for processing.")
+    colA, colB = st.columns([2, 1])
 
-    with col2:
-        st.write("**Attach documents** (multiple):")
-        uploads = st.file_uploader("Supported: .txt, .docx, .pdf", type=["txt", "docx", "pdf"], accept_multiple_files=True)
-        st.caption("Add ToR, needs assessments, partner profiles, annual reports, etc.")
-        geography = st.text_input("Target geography (optional)", "", help="e.g., Kenya; East Africa")
-        focus = st.text_input("Technical focus (optional)", "", help="e.g., livelihoods, climate resilience, education")
-        org = st.text_input("Organisation name (optional)", "", help="Shown in the summary header")
+    with colA:
+        st.session_state.scanner_paste = st.text_area(
+            "PASTE TOR / PROJECT DESCRIPTION",
+            st.session_state.scanner_paste,
+            height=300,
+            placeholder="Paste text here… (no character limit)",
+        )
+        c1, c2 = st.columns([1, 1])
+        with c1:
+            run_scan = st.button("Scan", type="primary")
+        with c2:
+            if st.button("Clear"):
+                st.session_state.scanner_paste = ""
+                st.session_state.scanner_summary_md = ""
+                st.session_state.scanner_text_raw = ""
 
-    if st.button("Scan"):
-        with st.spinner("Scanning documents and building summary…"):
-            collected_texts = []
-            files_info: List[Tuple[str, int, bool]] = []
-
-            if clean_text(pasted):
-                processed = enforce_soft_limit(pasted, PASTE_WORD_LIMIT)
-                collected_texts.append(processed)
-                files_info.append(("Pasted text", len(processed), True))
-
-            if uploads:
-                for up in uploads:
-                    txt = extract_text_from_upload(up)
-                    ok = len(clean_text(txt)) > 0
-                    files_info.append((up.name, len(txt), ok))
-                    if ok:
-                        collected_texts.append(txt)
-
-            if not collected_texts:
-                msg = "Please paste text or attach at least one parsable file (.txt/.docx"
-                if HAS_PYPDF2: msg += "/.pdf"
-                msg += ")."
-                st.warning(msg)
-                return
-
-            consolidated = "\n\n".join(collected_texts)
-            meta = mock_extract_meta(consolidated)
-
-            lines = []
-            lines.append("GRANT / TENDER SCAN — SUMMARY\n")
-            if org: lines.append(f"Organisation: {org}")
-            if geography: lines.append(f"Geography: {geography}")
-            if focus: lines.append(f"Technical focus: {focus}")
-            lines.append(f"Sectors: {', '.join(meta['sectors'])}")
-            lines.append(f"Likely geographies: {', '.join(meta['geos'])}")
-            lines.append(f"Donor alignment: {', '.join(meta['donors'])}")
-            lines.append(f"Red flags: {', '.join(meta['red'])}")
-            lines.append("\nHeadline analysis:")
-            lines.append("Feasible if partnered locally with clear outcomes, realistic unit costs, "
-                         "and early risk mitigation on timelines and due diligence.")
-            summary_text = "\n".join(lines)
-            time.sleep(0.2)
-
-        st.success("Scan complete!")
-        st.markdown("### Results")
-        st.markdown(f"<div class='card'><div class='lead'>{summary_text.replace(chr(10), '<br/>')}</div></div>", unsafe_allow_html=True)
-
-        # Build download (DOCX if available else TXT)
-        bytes_out = make_docx("Grant / Tender Scan — Summary", summary_text)
-        st.session_state.scanner_bytes = bytes_out
-        base = "scanner_summary_" + datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-        st.session_state.scanner_name = base + (".docx" if HAS_DOCX else ".txt")
-
-        st.download_button(
-            f"Download summary ({'.docx' if HAS_DOCX else '.txt'})",
-            data=bytes_out,
-            file_name=st.session_state.scanner_name,
-            mime=("application/vnd.openxmlformats-officedocument.wordprocessingml.document" if HAS_DOCX else "text/plain"),
+    with colB:
+        uploads = st.file_uploader(
+            "OR UPLOAD FILE(S)",
+            type=["txt", "docx", "pdf"],
+            accept_multiple_files=True,
+            help="TXT, DOCX, PDF; up to 200MB per file.",
         )
 
-        if uploads and any(u.name.lower().endswith(".pdf") for u in uploads) and not HAS_PYPDF2:
-            st.caption("Note: PDF text extraction requires `PyPDF2`. TXT/DOCX were processed normally.")
+    # ----- Scan logic -----
+    if run_scan:
+        chunks = []
+        if st.session_state.scanner_paste.strip():
+            chunks.append(st.session_state.scanner_paste)
+
+        if uploads:
+            for f in uploads:
+                txt = extract_text_from_upload(f)
+                if not txt:
+                    st.warning(f"Could not extract text from **{f.name}** (scanned PDF or unsupported). Try an OCR’d PDF or a DOCX/TXT.", icon="⚠️")
+                else:
+                    chunks.append(txt)
+
+        combined = clean_text("\n\n".join(chunks))
+        st.session_state.scanner_text_raw = combined
+
+        if not combined:
+            st.error("No readable text found. Paste text or upload OCR’d/real-text PDFs or DOCX/TXT files.")
+        else:
+            # Summarize heuristically
+            words = [w for w in re.findall(r"\b[\w-]+\b", combined)]
+            kw = naive_keywords(combined, topn=12)
+            bullets = detect_bullets(combined, max_lines=8)
+            maybe_bullets = bullets if bullets else ["(No bullet structure detected; see full text for details.)"]
+
+            # Very light heuristics to create a more concise structure
+            summary = f"""
+**GRANT / TENDER SCAN — SUMMARY**
+----------------------------------
+
+**Detected length:** ~{len(words)} words  
+**Prominent keywords (naive):** {", ".join(kw)}
+
+**Likely Requirements / Highlights:**
+- Clear deliverables, partners/stakeholders, timeline, and eligibility criteria typically expected.
+- Emphasis on measurable outcomes and value for money.
+- Ensure safeguarding/data-privacy provisions are addressed.
+
+**Detected bullet points (sample):**
+- """ + "\n- ".join(maybe_bullets) + """
+
+**Potential Risks / Considerations (heuristic):**
+- Tight timelines and eligibility constraints may limit competition.
+- Budget ceilings and any co-finance expectations should be confirmed.
+- Ensure alignment with donor priorities and local partner capacity.
+            """
+            st.session_state.scanner_summary_md = summary
+            st.success("Scan complete.")
+
+            # Save for exports
+            store_export("Scanner Summary", summary)
+
+    # ----- Show results -----
+    if st.session_state.scanner_summary_md:
+        st.subheader("Summary")
+        st.markdown(md_code_block(st.session_state.scanner_summary_md))
+
+        dl_bytes, dl_name = make_docx_bytes(st.session_state.scanner_summary_md, "Scanner_Summary")
+        st.download_button("Download DOCX", data=dl_bytes.getvalue(), file_name=dl_name, type="primary")
+
+        if st.session_state.scanner_text_raw:
+            with st.expander("Show extracted raw text"):
+                st.text_area("Extracted Text", st.session_state.scanner_text_raw, height=250)
+
 
 def page_trends():
-    prototype_banner()
-    st.title("Aid Trends (mock)")
-    c1, c2 = st.columns([2,1])
-    with c1:
-        keywords = st.text_input("Enter trend keywords (comma-separated)", "aid cuts, localisation, climate resilience, digital, blended finance")
-        geography = st.text_input("Geography / region (optional)", "East Africa")
-    with c2:
-        st.markdown("<div class='card muted'>Generates a succinct **two-page brief** to paste into proposals or share internally.</div>", unsafe_allow_html=True)
+    st.title("Aid Trends")
+    st.caption("Local prototype, no external APIs.")
 
-    if st.button("Generate two-page trends brief"):
-        with st.spinner("Generating trends brief…"):
-            brief = build_trends_brief(keywords, geography)
-            bytes_out = make_docx("Aid Trends Brief", brief)
-            st.session_state.trends_bytes = bytes_out
-            base = "trends_brief_" + datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-            st.session_state.trends_name = base + (".docx" if HAS_DOCX else ".txt")
-            time.sleep(0.2)
-        st.success("Trends brief ready!")
+    col1, col2 = st.columns(2)
+    with col1:
+        st.session_state.trends_region = st.selectbox("Region focus", ["Global", "Africa", "Asia", "MENA", "Europe", "LAC"], index=["Global","Africa","Asia","MENA","Europe","LAC"].index(st.session_state.trends_region))
+        st.session_state.trends_theme = st.selectbox("Theme focus", ["Climate", "Smart Agriculture", "Health", "Education", "Protection", "WASH"], index=["Climate","Smart Agriculture","Health","Education","Protection","WASH"].index(st.session_state.trends_theme))
+    with col2:
+        st.session_state.trends_horizon = st.selectbox("Time horizon", ["Short (6–12m)", "Medium (1–3y)", "Long (3–5y)"], index=["Short (6–12m)","Medium (1–3y)","Long (3–5y)"].index(st.session_state.trends_horizon))
+        st.session_state.trends_audience = st.selectbox("Audience", ["Programme Team", "Board / Exec", "Donor Relations"], index=["Programme Team","Board / Exec","Donor Relations"].index(st.session_state.trends_audience))
 
-    if st.session_state.trends_bytes:
-        st.markdown("### Aid Trends Brief")
-        st.download_button(
-            f"Download trends_brief ({'.docx' if HAS_DOCX else '.txt'})",
-            data=st.session_state.trends_bytes,
-            file_name=st.session_state.trends_name,
-            mime=("application/vnd.openxmlformats-officedocument.wordprocessingml.document" if HAS_DOCX else "text/plain"),
-        )
+    st.session_state.trends_notes = st.text_area("Optional analyst notes", st.session_state.trends_notes, placeholder="Any nuance you want to inject…")
 
-def page_concept():
-    prototype_banner()
+    if st.button("Generate Trends Brief", type="primary"):
+        r = st.session_state.trends_region
+        t = st.session_state.trends_theme
+        h = st.session_state.trends_horizon
+        a = st.session_state.trends_audience
+        n = st.session_state.trends_notes.strip()
+
+        sources = [
+            ("OECD CRS (2022–2024)", "https://stats.oecd.org/"),
+            ("Donor press releases & pipelines", "https://www.devex.com/news"),
+            ("GIIN/IFC blended finance insights", "https://thegiin.org/"),
+            ("Philanthropy data (Candid)", "https://candid.org/")
+        ]
+
+        brief = f"""
+AID TRENDS BRIEF — {r.upper()} / {t.upper()}
+--------------------------------------------
+
+Audience: {a} | Horizon: {h}
+
+1) Donor Shifts (illustrative):
+- Bilateral donors are consolidating portfolios; larger multi-country calls; fewer small awards.
+- In {t}, windows increasingly emphasise outcomes and co-finance hooks.
+- In {r}, flexible instruments (windows, challenge funds) prioritise catalytic pilots.
+
+2) Private Funding Pipelines (illustrative):
+- Corporate philanthropy in {r} is increasing around {t.lower()} & resilience.
+- Impact funds seek ‘pay-for-results’ structures with KPIs tied to climate/social outcomes.
+- Blended finance vehicles are emerging for place-based projects with measurable outcomes.
+
+3) Implications for NGOs:
+- Position consortia to deliver at scale; clarify unique role and local legitimacy.
+- Strengthen MEL for results-based disbursement; define 3–5 clear KPIs.
+- Prepare a pipeline of ‘shovel-ready’ concepts (12–24 months) with co-finance hooks.
+
+Indicative Sources:
+- """ + "\n- ".join([f"[{label}]({url})" for label, url in sources]) + (f"\n\nAnalyst Notes:\n- {n}" if n else "")
+
+        st.session_state.trends_brief_md = brief
+        st.success("Generated.")
+        store_export("Aid Trends Brief", brief)
+
+    if st.session_state.trends_brief_md:
+        st.subheader("Brief")
+        st.markdown(md_code_block(st.session_state.trends_brief_md))
+
+
+def page_concept_note():
     st.title("Concept Note Builder")
 
-    left, right = st.columns([1,1])
-    with left:
-        context = st.text_area(
-            "Project context / brief (used to seed each section)",
-            (
-                "Rural Kenya; tribal/pastoralist communities. Donor-ready concept note.\n"
-                "Objectives: access, quality, inclusion, resilience; integrate aid-cuts/trends.\n"
-                "Style: UK English, concise."
-            ),
-            height=140,
-            help="This seeds each section. Keep it concise."
-        )
-        st.caption(f"Words: {word_count(context)}")
-        trends_hint = st.text_input("Optional one-liner to weave in (e.g., trends insight)", "", help="Short phrase referenced across sections")
+    st.caption(
+        "Provide optional **key data/keywords** per section. The tool will also reuse your **Scanner** and **Trends** content when helpful. "
+        "Use sliders to choose approximate word counts."
+    )
 
-    with right:
-        st.write("**Word presets**")
-        b1, b2, b3 = st.columns(3)
-        preset_clicked = None
-        if b1.button("Short (300)"): preset_clicked = "Short"
-        if b2.button("Standard (600)"): preset_clicked = "Standard"
-        if b3.button("Long (1,000)"): preset_clicked = "Long"
+    sections = [
+        ("Background / Problem", 120),
+        ("Objectives", 100),
+        ("Approach / Theory of Change", 180),
+        ("Activities & Workplan", 160),
+        ("Geography & Beneficiaries", 120),
+        ("Partnerships & Governance", 120),
+        ("MEL & KPIs", 120),
+        ("Risk & Safeguarding", 120),
+        ("Budget Summary", 100),
+        ("Sustainability / Exit", 110),
+    ]
 
-    st.markdown("#### Sections & word counts")
-    selected_sections = []
-    for key, meta in st.session_state.sections.items():
-        colA, colB = st.columns([3,1])
-        with colA:
-            on_now = st.checkbox(meta["label"], value=meta["on"], key=f"on_{key}")
-        with colB:
-            default_words = WORDS_PRESETS.get(preset_clicked, meta["words"])
-            if preset_clicked:
-                meta["words"] = default_words
-            words = st.number_input("Words", min_value=150, max_value=1500, value=int(meta["words"]), step=50, key=f"words_{key}")
-        st.session_state.sections[key]["on"] = on_now
-        st.session_state.sections[key]["words"] = words
-        if on_now:
-            selected_sections.append({"key": key, "label": meta["label"], "words": int(words)})
+    # Helper: assemble text using light templates and feed-through info
+    def synthesize(section_name, words_target, hints):
+        scan_bits = st.session_state.scanner_summary_md.strip()
+        trends_bits = st.session_state.trends_brief_md.strip()
 
-    total_words = sum(s["words"] for s in selected_sections)
-    st.caption(f"Approx. total length: **{total_words:,} words**")
+        # Trim to target-ish length without an LLM: we compose bullet-like prose
+        base = []
+        if section_name == "Background / Problem":
+            base = [
+                "Context: the organisation seeks to address priority needs identified in recent funding calls and trends.",
+                "Problem statement: demand for measurable outcomes and scalable delivery is rising, alongside tighter eligibility and timelines.",
+                "Relevance: the proposed work aligns with donor priorities and local partner capacity in the target geography."
+            ]
+        elif section_name == "Objectives":
+            base = [
+                "Overall objective: improve outcomes for target groups through a results-based programme aligned with donor priorities.",
+                "Specific objectives: 3–5 measurable goals covering access, quality, and sustainability."
+            ]
+        elif section_name == "Approach / Theory of Change":
+            base = [
+                "We apply a theory-of-change rooted in evidence, incentives for performance, and learning loops.",
+                "Inputs lead to outputs (capacity, services, data), which lead to outcomes (improved practices, resilience) and impact.",
+            ]
+        elif section_name == "Activities & Workplan":
+            base = [
+                "Workstreams: WS1 capacity & systems; WS2 service delivery pilots; WS3 learning & scale-up.",
+                "Workplan includes inception, pilot, adaptation, and consolidation phases with clear milestones."
+            ]
+        elif section_name == "Geography & Beneficiaries":
+            base = [
+                "Target geography: focal regions selected for need and feasibility.",
+                "Beneficiaries: priority groups defined with clear inclusion criteria and reach estimates."
+            ]
+        elif section_name == "Partnerships & Governance":
+            base = [
+                "Partnership model: roles for local NGOs, government counterparts, private actors and technical partners.",
+                "Governance: a light PMU, advisory oversight, and working groups for delivery."
+            ]
+        elif section_name == "MEL & KPIs":
+            base = [
+                "MEL plan: results framework with indicators, baselines and targets; timely monitoring and learning events.",
+                "KPIs reflect outcomes and co-finance leverage where applicable."
+            ]
+        elif section_name == "Risk & Safeguarding":
+            base = [
+                "Key risks: delivery timelines, eligibility, data-privacy/safeguarding, and partner capacity.",
+                "Mitigation includes clear protocols, training, and escalation paths."
+            ]
+        elif section_name == "Budget Summary":
+            base = [
+                "Budget envelope covers personnel, delivery costs, MEL, and contingency.",
+                "Value-for-money approach: efficient management and leverage of co-finance where relevant."
+            ]
+        elif section_name == "Sustainability / Exit":
+            base = [
+                "Exit strategy: transfer of capacities, institutional ownership, and financing options.",
+                "Sustainability: co-design with local partners and progressive handover plan."
+            ]
 
-    if st.button("Generate Concept Note"):
-        if not selected_sections:
-            st.warning("Select at least one section.")
-        else:
-            with st.spinner("Composing concept note…"):
-                note_txt = build_concept_note(selected_sections, context, trends_hint)
-                bytes_out = make_docx("Concept Note (Draft)", note_txt)
-                st.session_state.concept_bytes = bytes_out
-                base = "concept_note_" + datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-                st.session_state.concept_name = base + (".docx" if HAS_DOCX else ".txt")
-                time.sleep(0.2)
-            st.success("Concept note ready!")
+        # weave in scanner/trends snippets if available
+        if scan_bits:
+            base.append("Relevance to the call: informed by the tender/ToR scan (requirements, timelines, outcomes).")
+        if trends_bits:
+            base.append("Positioning: aligned with current donor shifts and private funding pipelines as highlighted in the trends brief.")
 
-    if st.session_state.concept_bytes:
-        st.markdown("### Concept Note")
-        st.download_button(
-            f"Download concept_note ({'.docx' if HAS_DOCX else '.txt'})",
-            data=st.session_state.concept_bytes,
-            file_name=st.session_state.concept_name,
-            mime=("application/vnd.openxmlformats-officedocument.wordprocessingml.document" if HAS_DOCX else "text/plain"),
-        )
+        if hints.strip():
+            base.append(f"Key data/keywords from user: {hints.strip()}")
+
+        # Join and crop roughly
+        text = " ".join(base)
+        # crude crop to approx words_target
+        words = text.split()
+        if len(words) > words_target:
+            text = " ".join(words[:words_target]) + "…"
+        return text
+
+    # Draw UI for each section
+    built_sections = {}
+    for sec_name, default_words in sections:
+        st.markdown(f"### {sec_name}")
+        col1, col2 = st.columns([2, 1])
+        with col1:
+            hints = st.text_area(
+                "Add key data / keywords (optional)",
+                value=st.session_state.cn_sections.get(sec_name, {}).get("hints", ""),
+                key=f"hints_{sec_name}",
+                placeholder="E.g., locations, partner names, target figures, learning priorities…",
+            )
+        with col2:
+            tgt = st.slider("Approx. words", 60, 400, st.session_state.cn_sections.get(sec_name, {}).get("words", default_words), key=f"words_{sec_name}")
+
+        if st.button(f"Generate {sec_name}", key=f"gen_{sec_name}", use_container_width=True):
+            text = synthesize(sec_name, tgt, hints)
+            st.session_state.cn_sections[sec_name] = {"text": text, "words": tgt, "hints": hints}
+            st.success("Section generated.")
+
+        # show current section text if any
+        cur = st.session_state.cn_sections.get(sec_name, {}).get("text", "")
+        if cur:
+            st.text_area("Draft", value=cur, height=160, key=f"show_{sec_name}")
+
+        st.divider()
+
+    if st.button("Assemble full Concept Note", type="primary"):
+        parts = []
+        for sec_name, _ in sections:
+            t = st.session_state.cn_sections.get(sec_name, {}).get("text", "")
+            if t:
+                parts.append(f"## {sec_name}\n\n{t}\n")
+        full = f"# Concept Note Draft\nGenerated: {datetime.utcnow().isoformat()}Z\n\n" + "\n".join(parts)
+        st.session_state.cn_full_md = full
+        st.success("Assembled. A DOCX is also saved to Exports.")
+        store_export("Concept Note", full)
+
+    if st.session_state.cn_full_md:
+        st.subheader("Full draft")
+        st.markdown(md_code_block(st.session_state.cn_full_md))
+
 
 def page_exports():
-    prototype_banner()
     st.title("Exports")
-    st.write("Download the latest documents generated in other tabs.")
 
-    def chip(ok: bool):
-        pill("ready" if ok else "empty", "green" if ok else "red")
+    if not st.session_state.exports:
+        st.info("No exported documents yet. Generate a shortlist, scan, trends brief, or concept note first.")
+        return
 
-    def block(label: str, data_key: str, name_key: str, fallback: str):
-        st.subheader(label)
-        data = st.session_state.get(data_key)
-        name = st.session_state.get(name_key) or (fallback + (".docx" if HAS_DOCX else ".txt"))
-        chip(bool(data))
-        if not data:
-            st.caption("Nothing here yet — generate it first.")
-            return
-        st.download_button(f"Download {name}", data=data, file_name=name,
-                           mime=("application/vnd.openxmlformats-officedocument.wordprocessingml.document" if HAS_DOCX else "text/plain"))
+    for name, blob in st.session_state.exports.items():
+        st.write(f"**{name}**")
+        st.download_button(
+            "Download",
+            data=blob["bytes"],
+            file_name=blob["filename"],
+            key=f"dl_{name}",
+        )
+        st.divider()
 
-    block("Scanner Summary", "scanner_bytes", "scanner_name", "scanner_summary")
-    st.markdown("---")
-    block("Aid Trends Brief", "trends_bytes", "trends_name", "trends_brief")
-    st.markdown("---")
-    block("Concept Note", "concept_bytes", "concept_name", "concept_note")
 
 def page_settings():
-    prototype_banner()
     st.title("Settings")
-    st.write("Default section toggles and word counts.")
-    for key, meta in st.session_state.sections.items():
-        colA, colB = st.columns([3,1])
-        with colA:
-            on_now = st.checkbox(meta["label"], value=meta["on"], key=f"def_on_{key}")
-        with colB:
-            words_now = st.number_input("Words", min_value=150, max_value=1500, value=int(meta["words"]), step=50, key=f"def_words_{key}")
-        st.session_state.sections[key]["on"] = on_now
-        st.session_state.sections[key]["words"] = int(words_now)
-    st.success("Settings updated.")
 
-# ------------------------- Router -------------------------
-pill_css()
-st.sidebar.title("NGO AI Tool (Mock)")
-nav = st.sidebar.radio("Navigate", NAV, index=0)
-st.sidebar.caption("Local prototype, no external APIs.")
+    if st.button("Reset ALL stored content", type="secondary"):
+        for k in list(st.session_state.keys()):
+            del st.session_state[k]
+        ss_init()
+        st.success("All content cleared.")
 
-if nav == "Home":
-    page_home()
-elif nav == "Grant / Tender Scanner":
-    page_scanner()
-elif nav == "Aid Trends":
-    page_trends()
-elif nav == "Concept Note Builder":
-    page_concept()
-elif nav == "Exports":
-    page_exports()
-elif nav == "Settings":
-    page_settings()
+
+# =========================
+# Main
+# =========================
+def main():
+    ss_init()
+    sidebar_nav()
+
+    pages = {
+        "Home": page_home,
+        "Funding Feed": page_funding_feed,
+        "Grant / Tender Scanner": page_scanner,
+        "Aid Trends": page_trends,
+        "Concept Note Builder": page_concept_note,
+        "Exports": page_exports,
+        "Settings": page_settings,
+    }
+    pages[st.session_state.nav]()
+
+
+if __name__ == "__main__":
+    main()
